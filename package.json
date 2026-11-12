@@ -1,0 +1,7 @@
+{
+  "name": "nyc-quiz-scores",
+  "private": true,
+  "description": "The records table of the Manhattan Map Quiz (https://nyc-quiz.onrender.com)",
+  "engines": { "node": ">=18" },
+  "scripts": { "start": "node server.js" }
+}
