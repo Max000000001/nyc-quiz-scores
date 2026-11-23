@@ -5,7 +5,7 @@
 // over SSH with a deploy key that can write to that one repository only (env DEPLOY_KEY); KNOWN_HOSTS = GitHub's host keys;
 // QUIZ_KEY = the app's key, kept inside the sealed app.bin of the quiz.
 //   GET  /health                 -> ok (wakes the sleeping service; no key)
-//   GET  /top?mode=h0[&id=...]   -> { top: the best 10, me: the row with this id and its rank, total }
+//   GET  /top?mode=h0[&id=...][&limit=200]  -> { top: the best 10 (limit: 1..200, the records screen of the app asks 200), me: the row with this id and its rank, total }
 //   POST /add {id, mode, name, ok, n, km}  -> the same table, with the new row as «me»
 //   POST /del {id}               -> removes a row whose id starts with «selftest» (the deploy check only)
 //   POST /stats [{cat, key, n, miss, km}, ...]  -> { added }: the answers of one device in one batch (an object once per batch: n <= 50 answers,
@@ -126,9 +126,9 @@ function limited(map, req, max) {                                      // at mos
 const rate = r => r.ok / r.n, err = r => r.km / r.n;
 const order = (a, b) => rate(b) - rate(a) || err(a) - err(b) || a.d - b.d;
 const pub = r => ({ id: r.id, name: r.name, ok: r.ok, n: r.n, km: r.km, d: r.d });
-function table(mode, id) {
+function table(mode, id, lim) {
   const L = rows.filter(r => r.mode === mode).sort(order), i = id ? L.findIndex(r => r.id === id) : -1;
-  return { top: L.slice(0, 10).map(pub), me: i >= 0 ? { ...pub(L[i]), rank: i + 1 } : null, total: L.length };
+  return { top: L.slice(0, lim || 10).map(pub), me: i >= 0 ? { ...pub(L[i]), rank: i + 1 } : null, total: L.length };
 }
 
 function send(res, status, h, x) {
@@ -147,7 +147,8 @@ http.createServer((req, res) => {
   if (req.method === 'GET' && url.pathname === '/top') {
     const mode = url.searchParams.get('mode'), id = url.searchParams.get('id');
     if (!MODES.includes(mode)) return send(res, 400, h, { error: 'mode' });
-    return send(res, 200, h, table(mode, id && ID.test(id) ? id : null));
+    const lim = Math.min(200, Math.max(1, parseInt(url.searchParams.get('limit'), 10) || 10));   // the app's records screen asks for 200; older app versions send none (10)
+    return send(res, 200, h, table(mode, id && ID.test(id) ? id : null, lim));
   }
   if (req.method === 'GET' && url.pathname === '/hard') {
     const cat = url.searchParams.get('cat');
