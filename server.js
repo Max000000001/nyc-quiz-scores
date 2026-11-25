@@ -1,4 +1,5 @@
-// The records table of the Manhattan Map Quiz (https://nyc-quiz.onrender.com): the first whole round of each mode per device,
+// The records table of the Manhattan Map Quiz (https://nyc-quiz.onrender.com): the result of one whole GAME of a mode on a device (the whole round and
+// the rounds of the missed ones, added up; from 2026-11-25, the user: «Сохранять все круги, а не 1-й»; before that only the first round),
 // with a name, the share of correct answers and the mean error in km. Also the answer counts of all devices per object, for the
 // «Самые сложные» quiz (the hardest objects first).
 // A free Render web service. The rows live in scores.json, the counts in stats.json of a private GitHub repository (env DATA_REPO = owner/name), reached
@@ -6,7 +7,9 @@
 // QUIZ_KEY = the app's key, kept inside the sealed app.bin of the quiz.
 //   GET  /health                 -> ok (wakes the sleeping service; no key)
 //   GET  /top?mode=h0[&id=...][&limit=200]  -> { top: the best 10 (limit: 1..200, the records screen of the app asks 200), me: the row with this id and its rank, total }
-//   POST /add {id, mode, name, ok, n, km}  -> the same table, with the new row as «me»
+//   POST /add {id, mode, name, ok, n, km, d, v: 2}  -> the same table, with the new row as «me»; v: 2 = the result of a whole game (2026-11-25), without it: 400 (an old
+//                                   app version would send a first round); d = when the result was made on the device (ms, not in the future), else the time of the call
+//                                   Rows without v: 2 (the first-round rule of 2026-11-12..2026-11-24) are dropped once, when the service starts.
 //   POST /del {id}               -> removes a row whose id starts with «selftest» (the deploy check only)
 //   POST /stats [{cat, key, n, miss, km}, ...]  -> { added }: the answers of one device in one batch (an object once per batch: n <= 50 answers,
 //                                   miss of them wrong, km = the distances of the misses added up; <= 300 objects; the whole batch or nothing)
@@ -20,8 +23,8 @@ const { execFile } = require('child_process');
 const MODES = ['hoods', 'h0', 'h1', 'streets', 'sights', 'subway'];
 const CATS = ['hood', 'street', 'sight', 'station'];                 // what an object is (hoods, h0 and h1 all ask about «hood»)
 const DRY = process.env.DRY_STATS === '1';
-const ORIGINS = ['https://nyc-quiz.onrender.com', 'null'];          // the site; «null» = the local file during checks
-if (DRY) ORIGINS.push('http://127.0.0.1:8765', 'http://localhost:8765');   // the local test page
+const ORIGINS = ['https://nyc-quiz.onrender.com'];                  // the site (review 2026.11.25, L5: «null» only in the dry test mode)
+if (DRY) ORIGINS.push('null', 'http://127.0.0.1:8765', 'http://localhost:8765');   // «null» = the local file during checks; the local test page
 const ID = /^[a-z0-9]{8,32}$/;
 const KEY = /^[^\u0000-\u001f\u007f]{1,80}$/;                          // an object's key in the counts
 const MAXKEYS = 5000, FLUSH = +process.env.STATS_FLUSH_MS || 60000;     // per type (the quiz has 84 / 951 / 1807 / 121 objects); the write interval
@@ -29,6 +32,9 @@ const TMP = os.tmpdir(), DIR = DRY ? process.env.DRY_DIR || path.join(TMP, 'scor
   KEYF = path.join(TMP, 'deploy_key'), KH = path.join(TMP, 'known_hosts');
 const GITENV = { ...process.env, GIT_SSH_COMMAND: 'ssh -i ' + KEYF + ' -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=' + KH };
 
+const QK = process.env.QUIZ_KEY || '';                                 // review 2026.11.25, M2: no key = no start (it used to be an open API); constant-time compare
+if (QK.length < 16 && !DRY) { console.log('QUIZ_KEY missing or too short'); process.exit(1); }
+const sameKey = v => crypto.timingSafeEqual(crypto.createHash('sha256').update(String(v || '')).digest(), crypto.createHash('sha256').update(QK).digest());
 let rows = [], state = 'starting', queue = Promise.resolve();
 const newStats = () => Object.fromEntries(CATS.map(c => [c, Object.create(null)]));   // no prototype: a key may be «__proto__»
 let stats = newStats(), statsDirty = false, statsTimer = null;        // cat -> key -> [answers, misses, km] of all devices
@@ -55,12 +61,19 @@ async function init() {
     await run(['clone', '-q', '--depth', '1', 'git@github.com:' + process.env.DATA_REPO + '.git', DIR], TMP);
   }
   rows = DRY && !fs.existsSync(path.join(DIR, 'scores.json')) ? [] : JSON.parse(fs.readFileSync(path.join(DIR, 'scores.json'), 'utf8'));
+  // 2026-11-25 (the user: «по другим всё удали, если там нельзя все круги посчитать»): a row is the result of a whole game (v: 2). The rows of the first-round rule have no v:
+  // they are dropped once here (a repeat finds none); the app sends again the games it can still add up from the rounds kept on the device.
+  const old = rows.filter(r => !r || r.v !== 2).length;
+  if (old) { rows = rows.filter(r => r && r.v === 2); console.log('dropped the first-round rows:', old); await save('drop ' + old + ' first-round rows (the table takes whole games from 2026-11-25)'); }
   stats = loadStats();
   state = 'ready';
   console.log('rows loaded:', rows.length, '| objects counted:', CATS.map(c => c + ' ' + Object.keys(stats[c]).length).join(', '));
 }
 
+let pending = 0;                                                       // writes waiting in the queue (review 2026.11.25, M3: a burst must not build an endless queue)
 function write(file, text, msg) {                                      // one write at a time (one queue for both files); a failed push is retried on top of the remote
+  if (pending >= 50) return Promise.resolve(false);                    // the data stays in memory and goes out with the next write
+  pending++;
   queue = queue.then(async () => {
     fs.writeFileSync(path.join(DIR, file), text());
     if (DRY) return true;
@@ -71,7 +84,8 @@ function write(file, text, msg) {                                      // one wr
     catch (e) { await run(['pull', '-q', '--rebase', 'origin', 'main'], DIR); await run(['push', '-q', 'origin', 'HEAD:main'], DIR); }
     return true;
   }).catch(e => { console.log('save failed:', e.message); return false; });
-  return queue;
+  const q = queue; q.then(() => { pending--; });                       // catch above never rejects, so this always runs
+  return q;
 }
 const save = msg => write('scores.json', () => JSON.stringify(rows, null, 0).replace(/\},\{/g, '},\n{'), msg);
 
@@ -142,7 +156,7 @@ http.createServer((req, res) => {
     'Access-Control-Allow-Headers': 'Content-Type, X-Key', 'Access-Control-Max-Age': '86400', 'Vary': 'Origin' };
   if (req.method === 'OPTIONS') { res.writeHead(204, h); return res.end(); }
   if (url.pathname === '/health') return send(res, state === 'ready' ? 200 : 503, h, { state });
-  if (req.headers['x-key'] !== process.env.QUIZ_KEY) return send(res, 403, h, { error: 'key' });
+  if (!sameKey(req.headers['x-key'])) return send(res, 403, h, { error: 'key' });
   if (state !== 'ready') return send(res, 503, h, { error: 'starting' });
   if (req.method === 'GET' && url.pathname === '/top') {
     const mode = url.searchParams.get('mode'), id = url.searchParams.get('id');
@@ -174,13 +188,16 @@ http.createServer((req, res) => {
       if (rows.length !== n0) await save('remove a test row');
       return send(res, 200, h, { removed: n0 - rows.length });
     }
-    const name = String(b.name || '').replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 24);
+    const name0 = String(b.name || '').replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim(); const name = Array.from(name0).slice(0, 24).join('');   // L8: not in the middle of an emoji
     const { ok, n, km } = b;
     if (!MODES.includes(b.mode) || !ID.test(String(b.id)) || !name || !Number.isInteger(ok) || !Number.isInteger(n) || n < 5 || n > 5000
         || ok < 0 || ok > n || typeof km !== 'number' || !(km >= 0) || km > n * 30) return send(res, 400, h, { error: 'bad' });
+    if (b.v !== 2) return send(res, 400, h, { error: 'old app' });     // 2026-11-25: only the result of a whole game; an app that still sends a first round gets this
     if (!rows.some(r => r.id === b.id)) {                              // a resend keeps the first row
+      if (rows.length >= 20000) return send(res, 503, h, { error: 'full' });          // M3: the table has a ceiling
       if (limited(recent, req, 20)) return send(res, 429, h, { error: 'later' });   // at most 20 rows an hour from one address
-      rows.push({ id: b.id, mode: b.mode, name, ok, n, km: Math.round(km * 1000) / 1000, d: Date.now() });
+      const d = Number.isFinite(b.d) && b.d > 1.7e12 && b.d <= Date.now() + 60000 ? Math.round(b.d) : Date.now();   // the time the game ended on the device (a game that waited offline keeps it)
+      rows.push({ id: b.id, mode: b.mode, name, ok, n, km: Math.round(km * 1000) / 1000, d, v: 2 });
       await save('a result in ' + b.mode);
     }
     send(res, 200, h, table(b.mode, b.id));
